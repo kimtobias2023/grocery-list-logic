@@ -11,7 +11,7 @@ DB_NAME = "mealplanning"
 DB_USER = "postgres"
 DB_PASSWORD = "new-website-app"
 DB_PORT = "5432"
-FT_PATH = "crawl-300d-2M-subword.vec"
+FT_PATH = "models/crawl-300d-2M-subword.vec"
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
 
@@ -70,9 +70,12 @@ def store_local_sub_embeddings(ft_model):
     logging.info(f"Found {len(rows)} local bridging rows to embed.")
 
     insert_sql = """
-        INSERT INTO ingredient_sub_embeddings 
-         (ingredient_id, sub_label, sub_text, embedding, weight)
-         VALUES (%s, %s, %s, %s, %s)
+    INSERT INTO ingredient_sub_embeddings
+    (ingredient_id, sub_label, sub_text, embedding, weight)
+    VALUES (%s,%s,%s,%s,%s)
+    ON CONFLICT (ingredient_id, sub_label, sub_text)
+    DO UPDATE SET embedding = EXCLUDED.embedding,
+                weight    = EXCLUDED.weight
     """
 
     for ing_id, mod_text, w in rows:
@@ -133,7 +136,7 @@ def store_usda_sub_embeddings(ft_model):
 
 def main():
     ft_model = load_fasttext_model()
-    store_local_sub_embeddings(ft_model)
+    #store_local_sub_embeddings(ft_model)
     store_usda_sub_embeddings(ft_model)
 
 if __name__ == "__main__":
