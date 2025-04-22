@@ -13,14 +13,13 @@ from rapidfuzz import fuzz
 from functools import lru_cache
 from gensim.models import KeyedVectors
 from nltk.corpus import wordnet                # nltk.download('wordnet') once
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #####################################################################
 # CONFIG
 #####################################################################
 DB = dict(host="localhost", dbname="mealplanning",
           user="postgres",  password="new-website-app", port=5432)
-FT_PATH = "models/fasttext.kv"
+FT_PATH = "models/crawl-300d-2M-subword.vec"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s: %(message)s")
@@ -175,16 +174,6 @@ def backfill_units_meta():
         c.commit()
 
 @lru_cache(maxsize=4096)
-def volume_to_count(usda_id: int, size_hint: str | None = None) -> float | None:
-    """
-    Return how many pieces are in 1 cup (240 ml) of produce.
-    E.g., if 1 cup = 120g and 1 medium piece = 15g, return 8.
-    """
-    piece_wt, cup_wt = _usda_weights(usda_id, size_hint)
-    if not piece_wt or not cup_wt:
-        return None
-    return cup_wt / piece_wt  # number of pieces per 1 cup
-
 @lru_cache(maxsize=4096)
 def _usda_weights(usda_id: int,
                   want_size: str | None = None
@@ -231,28 +220,20 @@ def _usda_weights(usda_id: int,
 #####################################################################
 # One‑shot lookup tables – we fetch them **once** at start‑up 🔹
 #####################################################################
-with db() as conn, conn.cursor() as cur:
-    cur.execute("""
-        SELECT 'stop' AS kind, chunk_text AS a, NULL::text AS b, NULL::float AS m FROM stop_chunks
-        UNION ALL
-        SELECT 'antonym', chunk_a, chunk_b, NULL FROM antonyms
-        UNION ALL
-        SELECT 'domain', chunk_text, NULL, weight_multiplier FROM domain_weights
-    """)
+with db() as _conn, _conn.cursor() as cur:
+    # stop‑chunks
+    cur.execute("SELECT chunk_text FROM stop_chunks")
+    STOP_CHUNKS: set[str] = {r[0].lower().strip() for r in cur.fetchall()}
 
-    STOP_CHUNKS = set()
-    ANTONYM     = defaultdict(set)
-    DOMAIN_W    = {}
+    # antonyms
+    cur.execute("SELECT chunk_a, chunk_b FROM antonyms")
+    ANTONYM: dict[str,set[str]] = defaultdict(set)
+    for a,b in cur.fetchall():
+        ANTONYM[a.lower().strip()].add(b.lower().strip())
 
-    for kind, a, b, m in cur.fetchall():
-        a = a.strip().lower() if a else None
-        b = b.strip().lower() if b else None
-        if kind == 'stop':
-            STOP_CHUNKS.add(a)
-        elif kind == 'antonym' and b:
-            ANTONYM[a].add(b)
-        elif kind == 'domain' and m:
-            DOMAIN_W[a] = float(m)
+    # domain weights
+    cur.execute("SELECT chunk_text, weight_multiplier FROM domain_weights")
+    DOMAIN_W: dict[str,float] = {t.lower().strip(): float(m) for t,m in cur.fetchall()}
 
 #####################################################################
 # WordNet synonyms  (cached)
@@ -269,16 +250,16 @@ def syns(word: str) -> set[str]:
 #####################################################################
 def load_ft():
     logging.info("Loading FastText vectors …")
-    model = KeyedVectors.load(FT_PATH)   # ← changed this line
+    model = KeyedVectors.load_word2vec_format(FT_PATH, binary=False)
     logging.info("FastText ready.")
     return model
 
-FT = load_ft()                                 # 🔹
+FT = load_ft()                                  # 🔹
 
 #####################################################################
 # Read stored SUB‑embeddings
 #####################################################################
-def load_sub_embeddings(table: str, id_col: str) -> dict[int, list]:
+def load_sub_embeddings(table: str, id_col: str) -> dict[int,list]:
     sql = f"""
        SELECT {id_col}, sub_text, embedding, weight
        FROM   {table}
@@ -288,9 +269,9 @@ def load_sub_embeddings(table: str, id_col: str) -> dict[int, list]:
     with db() as conn, conn.cursor() as cur:
         cur.execute(sql)
         for _id, txt, emb, w in cur.fetchall():
-            vec = np.array(emb, dtype='float32')
-            norm = np.linalg.norm(vec)
-            data[_id].append((txt.lower().strip(), vec, float(w), norm))
+            data[_id].append((txt.lower().strip(),
+                              np.array(emb, dtype='float32'),
+                              float(w)))
     return data
 
 LOCAL = load_sub_embeddings("ingredient_sub_embeddings", "ingredient_id")
@@ -299,23 +280,23 @@ USDA  = load_sub_embeddings("usda_sub_embeddings",        "usda_ingredient_id")
 #####################################################################
 #  low‑level chunk‑match
 #####################################################################
-def chunks_match(
-    a_token: str, a_vec, a_norm: float,
-    b_token: str, b_vec, b_norm: float,
-    embed_thr=.75, fuzz_thr=80
-) -> bool:
-    if b_token in ANTONYM.get(a_token, ()):
+def chunks_match(a_txt, a_vec, b_txt, b_vec,
+                 embed_thr=.75, fuzz_thr=80) -> bool:
+
+    # quick reject: antonyms 🔹
+    if b_txt in ANTONYM.get(a_txt, ()):          # salted vs unsalted etc.
         return False
 
-    if a_token == b_token:
+    if a_txt == b_txt:
         return True
-    if b_token in syns(a_token):
+    if b_txt in syns(a_txt):
         return True
-    if fuzz.ratio(a_token, b_token) >= fuzz_thr:
+    if fuzz.ratio(a_txt, b_txt) >= fuzz_thr:
         return True
-    if (a_vec is not None and b_vec is not None and a_norm and b_norm):
-        return np.dot(a_vec, b_vec) / (a_norm * b_norm) >= embed_thr
-
+    if (a_vec is not None and b_vec is not None and
+        (na:=np.linalg.norm(a_vec)) and (nb:=np.linalg.norm(b_vec)) and
+        np.dot(a_vec, b_vec)/(na*nb) >= embed_thr):
+        return True
     return False
 
 #####################################################################
@@ -326,25 +307,24 @@ def wjacc(local, usda) -> float:
     match_w = 0.0
 
     # apply domain weights 🔹
-    loc  = [(t, v, w * DOMAIN_W.get(t, 1.0), norm) for t, v, w, norm in local]
-    usda = [(t, v, w * DOMAIN_W.get(t, 1.0), norm) for t, v, w, norm in usda]
+    loc  = [(t,v, w*DOMAIN_W.get(t,1.0)) for t,v,w in local]
+    usda = [(t,v, w*DOMAIN_W.get(t,1.0)) for t,v,w in usda]
 
-
-    for lt, lv, lw, ln in loc:
-        for i, (ut, uv, uw, un) in enumerate(usda):
+    for lt, lv, lw in loc:
+        for i,(ut, uv, uw) in enumerate(usda):
             if used[i]:
                 continue
-            if chunks_match(lt, lv, ln, ut, uv, un):
+            if chunks_match(lt, lv, ut, uv):
                 match_w += min(lw, uw)
                 used[i] = True
                 break
 
-    total_l = sum(w for _,_,w,_ in loc)
+    total_l = sum(w for _,_,w in loc)
     total_u = 0.0
-    for (ut, _, uw, _), flag in zip(usda, used):
-        if flag:
+    for (ut,_,uw), flag in zip(usda, used):
+        if flag:                      # matched
             total_u += uw
-        else:
+        else:                         # leftover
             pen = .2 if ut in STOP_CHUNKS else 1.0
             total_u += pen * uw
 
@@ -356,12 +336,12 @@ def wjacc(local, usda) -> float:
 #####################################################################
 TOK_IDX: dict[str,set[int]] = defaultdict(set)
 for uid, chs in USDA.items():
-    for t, *_ in chs:
+    for t,_,_ in chs:
         TOK_IDX[t].add(uid)
 
 def candidates(local_chunks):
     cset = set()
-    for t, *_ in local_chunks:
+    for t,_,_ in local_chunks:
         if t in TOK_IDX:
             cset |= TOK_IDX[t]
         else:
@@ -394,26 +374,19 @@ def save_match(local_id, pairs):                 # pairs already sorted by score
 #####################################################################
 # MAIN batch
 #####################################################################
-def run(top_k=3, max_workers=4):
+def run(top_k=3):
     logging.info("=== matching starts ===")
-    results = {}
-
-    def match_one(lid, loc_chunks):
+    for lid, loc_chunks in LOCAL.items():
         cands = candidates(loc_chunks)
         if not cands:
-            return lid, []
+            continue
         scored = [(uid, wjacc(loc_chunks, USDA[uid])) for uid in cands]
-        scored = [(u, s) for u, s in scored if s > 0.0]
+        scored = [(u,s) for u,s in scored if s>0.0]
+        if not scored:
+            continue
         best = sorted(scored, key=lambda x: -x[1])[:top_k]
-        save_match(lid, best)
-        return lid, best
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(match_one, lid, chunks): lid for lid, chunks in LOCAL.items()}
-        for future in as_completed(futures):
-            lid, best = future.result()
-            if best:
-                results[lid] = best
+        results[lid] = best
+        save_match(lid, best)                   # 🔹 write to DB
 
     logging.info("matching finished.")
 

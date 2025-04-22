@@ -37,6 +37,14 @@ G2OZ      = 1 / 28.349523125
 ML2FLOZ   = 1 / 29.5735295625
 OZ2G      = 28.349523125
 FLOZ2ML   = 29.5735295625
+# preferred dimension per class
+CLASS_PREF = {
+    "produce": ("count",  "mass"),
+    "eggs":    ("count",  "mass"),
+    "meat":    ("mass",   None),
+    "dairy":   ("volume", "mass"),
+    "liquid":  ("volume", "mass"),
+}
 
 # ───────────────────────────── helpers ─────────────────────────────
 def db(): return psycopg2.connect(**DB)
@@ -224,114 +232,94 @@ def aggregate(ri_ids):
     # ─── walk every parent row ───────────────────────────────────
     for ri_id, recipe_id, local_id, raw in parents:
         LOG.debug("─  parent id=%s  raw='%s'", ri_id, raw)
-        if not local_id:  # fallback lookup
+        if not local_id:                                   # fallback lookup
             local_id = CANON2ID.get(raw.lower().strip())
             LOG.debug("    resolved local_id=%s", local_id)
-
-        target_class = CLASS_OF.get(local_id, "other")  # mass | volume | count | other
-        rows = Q[ri_id]
-        if not rows:
-            rows = [dict(rq_id=None, quantity=None, unit_id=None,
-                        qtxt="", sub_label="")]
-        LOG.debug("    %d quantity rows", len(rows))
-
-        # helper: dimension for a row
-        def _dim(r):
-            return unit_info(r['unit_id'])[0] if r['unit_id'] else "count"
-
-        # skip matching if class is count and all rows are count
-        all_dims = {_dim(r) for r in rows}
-        skip_matching = (target_class == "count") and all_dims == {"count"}
-        if skip_matching:
-            LOG.debug("🧺 Skipping USDA match for count-type: %s", raw)
-
-        # get USDA ID
-        if skip_matching:
-            usda_id = f"local:{local_id}"
-            score = 1.0
+   
+        # ― best USDA id
+        if local_id and (uid := usda_by_cached_match(local_id)):
+            usda_id, score = uid, 1.0
+            LOG.debug("    cached USDA=%s (score=1.0)", uid)
         else:
-            if local_id and (uid := usda_by_cached_match(local_id)):
-                usda_id, score = uid, 1.0
-                LOG.debug("    cached USDA=%s (score=1.0)", uid)
+            if local_id:
+                usda_id, score = best_usda_for_local(local_id)
             else:
-                if local_id:
-                    usda_id, score = best_usda_for_local(local_id)
-                else:
-                    token = raw.split(',')[0].split('(')[0]
-                    usda_id, score = best_usda_for_text_inline(token.lower())
-                LOG.debug("    matcher USDA=%s  score=%.3f", usda_id, score)
+                token = raw.split(',')[0].split('(')[0]
+                usda_id, score = best_usda_for_text_inline(token.lower())
+            LOG.debug("    matcher USDA=%s  score=%.3f", usda_id, score)
+
 
         if not usda_id:
             LOG.warning("No USDA match for “%s” – skipped", raw)
             record_gap("no_usda_match", raw_text=raw, local_id=local_id)
             continue
 
-        grocery[usda_id]['class'] = target_class
+        # ― class
+        ingr_class = CLASS_OF.get(local_id, "other")
+        grocery[usda_id]['class'] = ingr_class
 
-        # choose primary quantity
+        # ― choose ONE primary quantity row ──────────────────────
+        rows = Q[ri_id]
+        if not rows:                                        # no numbers at all
+            rows = [dict(rq_id=None, quantity=None, unit_id=None,
+                         qtxt="", sub_label="")]
+        LOG.debug("    %d quantity rows", len(rows))
+
+        # helper: dimension for a row
+        def _dim(r):
+            return unit_info(r['unit_id'])[0] if r['unit_id'] else None
+
         mass_rows   = [r for r in rows if _dim(r) == 'mass']
         volume_rows = [r for r in rows if _dim(r) == 'volume']
+
         if   mass_rows  : primary = max(mass_rows,   key=lambda r: float(r['quantity'] or 0))
         elif volume_rows: primary = max(volume_rows, key=lambda r: float(r['quantity'] or 0))
         else:
             primary = next((r for r in rows if r['sub_label'] == 'a'), rows[0])
-        LOG.debug("    primary row=%s", primary)
+            LOG.debug("    primary row=%s", primary)
 
-        # extract size hint
+        # — extract size hint from quantity_text —
         size_hint = None
         if primary['qtxt']:
             for w in {"small", "medium", "large"}:
                 if w in primary['qtxt'].lower():
                     size_hint = w
                     break
+
+        # Default to medium if not specified
         size_hint = size_hint or "medium"
         LOG.debug("    size_hint=%s", size_hint)
 
-        # convert/calculate
+        # ― convert / cache ──────────────────────────────────────
         rq   = primary['rq_id']
         base = float(primary['quantity']) if primary['quantity'] else 1.0
         dim, cf, _ = unit_info(primary['unit_id']) if primary['unit_id'] else (None, None, None)
 
-        # fallback for oz → g if cf is missing
-        if dim == "mass" and cf is None:
-            unit_name = UNIT_CACHE.get(primary['unit_id'], (None, None, None))[2]
-            if unit_name and unit_name.lower() in {"oz", "ounce", "ounces"}:
-                cf = OZ2G
-                _add_note(grocery[usda_id], f"{base:g} oz × {cf:.2f} g/oz = {base * cf:.2f} g")
-
-
-        _add_note(grocery[usda_id], f"{primary['qtxt'] or '1×'} → {base:g} {dim or 'count'}")
+        _add_note(grocery[usda_id], f"{primary['qtxt'] or '1×'} "
+                                    f"→ {base:g} {dim or 'count'}")
 
         cache = cached_conversion(rq) if rq else None
         if cache:
             _, ref_qty, ref_dim = cache
         else:
             ref_qty, ref_dim = base, "count"
-        if dim == "mass":
-            if cf is not None:
-                ref_qty, ref_dim = base * cf, "mass"
-
-                unit_name = UNIT_CACHE.get(primary['unit_id'], (None, None, None))[2] or "oz"
-                _add_note(grocery[usda_id],
-                        f"{base:g} {unit_name} × {cf:.2f} g/{unit_name} = {ref_qty:.2f} g")
-
-        if dim == "volume":
-            if cf is not None:
-                ref_qty, ref_dim = base * cf, "volume"
-
-                unit_name = UNIT_CACHE.get(primary['unit_id'], (None, None, None))[2] or "fl oz"
-                _add_note(grocery[usda_id],
-                        f"{base:g} {unit_name} × {cf:.2f} ml/{unit_name} = {ref_qty:.2f} ml")
-
+            if dim == "mass"   and cf: ref_qty, ref_dim = base * cf, "mass"
+            if dim == "volume" and cf: ref_qty, ref_dim = base * cf, "volume"
             LOG.debug("    -> %.3f %s", ref_qty, ref_dim)
-            if rq:
+            if rq:                                                 # only store when we have an rq_id
                 save_conversion(rq, usda_id, ref_qty, ref_dim)
 
-        # use subtype if available
+        # ─── use subtype if available for piece dimension ────────
         subtype = SUBTYPE_CACHE.get(rq)
-        key = f"piece::{subtype}" if ref_dim == "count" and subtype else ref_dim
+
+        # modified key logic
+        if ref_dim == "count" and subtype:
+            key = f"piece::{subtype}"
+        else:
+            key = ref_dim
 
         grocery[usda_id]['buckets'][key] += ref_qty
+
         grocery[usda_id]['items'].append(dict(
             recipe_id = recipe_id,
             rq_id     = rq,
@@ -340,7 +328,6 @@ def aggregate(ri_ids):
             subtype   = subtype,
             original  = primary['qtxt']
         ))
-
 
     LOG.debug("⏱ matching USDA ingredients took %.3fs", time.perf_counter() - t1)
     t2 = time.perf_counter()
@@ -351,37 +338,30 @@ def aggregate(ri_ids):
 
     # ─── resolve USDA names ─────────────────────────────────────
     with db() as c, c.cursor() as cur:
-        real_usda_ids = [uid for uid in grocery if isinstance(uid, int)]
         cur.execute("""
             SELECT id, canonical_name
-            FROM usda_ingredients
-            WHERE id = ANY(%s)
-        """, (real_usda_ids,))
+              FROM usda_ingredients
+             WHERE id = ANY(%s)
+        """, (list(grocery.keys()),))
         NAME = {i: n for i, n in cur.fetchall()}
 
-    # ─── post‑process count-class items: convert vol/mass → count ───────
+    # ─── post‑process produce: convert vol/mass → count ──────────────
     for uid, data in grocery.items():
-        
-        if data['class'] != 'count':
+        if data['class'] != 'produce':
             continue
 
-        if isinstance(uid, str) and uid.startswith("local:"):
-            continue  # already final count, skip any conversion
-
         b = data['buckets']
-        piece_wt, cup_wt = _usda_weights(uid, size_hint)
+        piece_wt, cup_wt = _usda_weights(uid, size_hint)   # (g per piece, g per cup)
 
-        if piece_wt:
-            _add_note(data, f"(USDA) 1 piece ({size_hint}) = {piece_wt:.2f} g")
-        if cup_wt:
-            _add_note(data, f"(USDA) 1 cup = {cup_wt:.2f} g")
-
-        if b['volume'] and not cup_wt:
-            record_gap("no_cup_wt", usda_id=uid, info={"volume_ml": float(b['volume'])})
-        if b['mass'] and not piece_wt:
-            record_gap("no_piece_wt", usda_id=uid, info={"mass_g": float(b['mass'])})
-
-        # ① volume → count
+        # --- sanity gaps ---------------------------------------------
+        if b['volume'] and cup_wt is None:
+            record_gap("no_cup_wt", usda_id=uid,
+                    info={"volume_ml": float(b['volume'])})
+        if b['mass'] and piece_wt is None:
+            record_gap("no_piece_wt", usda_id=uid,
+                    info={"mass_g": float(b['mass'])})
+            
+        # ① volume → count directly if possible
         pcs_per_cup = volume_to_count(uid, size_hint)
         if b['volume'] and pcs_per_cup:
             pcs_float = b['volume'] / 240.0 * pcs_per_cup
@@ -390,34 +370,14 @@ def aggregate(ri_ids):
             b['count'] += pcs
             b['volume'] = 0.0
 
-        # ② mass → count
+        # ② mass → pieces
         if b['mass'] and piece_wt:
             pcs_float = b['mass'] / piece_wt
-            pcs = ceil(pcs_float)
-            _add_note(data, f"{b['mass']:.2f} g ÷ {piece_wt:.2f} g/pc = {pcs_float:.2f} → {pcs} pcs")
-            b['count'] += pcs
-            b['mass'] = 0.0
-
-    # ─── post‑process volume-class items: convert mass → volume ───────
-    for uid, data in grocery.items():
-        cls = data['class']
-        b = data['buckets']
-
-        if cls != "volume":
-            continue
-
-        if not b.get("mass") or b.get("volume"):
-            continue  # nothing to convert or already handled
-
-        _, g_per_cup = _usda_weights(uid, size_hint)
-        if g_per_cup:
-            g = b['mass']
-            cups_float = g / g_per_cup
-            ml = cups_float * 240
-            b['volume'] += ml
-            b['mass'] = 0.0
+            pcs = ceil(pcs_float)                     # ← round *up*
             _add_note(data,
-                f"{g:.2f} g ÷ {g_per_cup:.2f} g/cup × 240 ml = {ml:.2f} ml")
+                f"{b['mass']:.2f} g ÷ {piece_wt:.2f} g/pc = {pcs_float:.2f} → {pcs} pcs")
+            b['count'] += pcs
+            b['mass']   = 0.0
 
     LOG.debug("⏱ converted + aggregated all units in %.3fs", time.perf_counter() - t2)
     t3 = time.perf_counter()
@@ -425,12 +385,16 @@ def aggregate(ri_ids):
     # ─── format output ──────────────────────────────────────────
     out = []
     for uid, data in grocery.items():
-        cls = data['class']
-        buckets = data['buckets']
+        cls         = data['class']
+        pref1, pref2= CLASS_PREF.get(cls, ("mass", None))
+        buckets     = data['buckets']
 
-        dim = cls if buckets[cls] else next((d for d, v in buckets.items() if v), "count")
+        dim = (pref1 if buckets[pref1] else
+               (pref2 if pref2 and buckets[pref2] else
+                next((d for d, v in buckets.items() if v), "count")))
         qty = buckets[dim]
 
+        # user‑unit conversion
         if dim == "mass":
             qty_disp  = qty if USER_UNIT_SYSTEM == "metric" else qty * G2OZ
             unit_disp = "g" if USER_UNIT_SYSTEM == "metric" else "oz"
@@ -438,8 +402,9 @@ def aggregate(ri_ids):
             qty_disp  = qty if USER_UNIT_SYSTEM == "metric" else qty * ML2FLOZ
             unit_disp = "ml" if USER_UNIT_SYSTEM == "metric" else "fl oz"
         else:
-            qty_disp  = ceil(qty)
+            qty_disp  = ceil(qty)         # round up display
             unit_disp = "count"
+
 
         out.append(dict(
             usda_id   = uid,
@@ -448,31 +413,23 @@ def aggregate(ri_ids):
             quantity  = round(qty_disp, 2),
             unit      = unit_disp,
             items     = data['items'],
-            trace     = data.get('notes', [])
+            trace     = data.get('notes', [])          #  ←  NEW
         ))
-
     LOG.info("✅ TOTAL: aggregate() completed in %.3fs", time.perf_counter() - t0)
-    return out
 
+    return out
 
 # ────────────────────────────── demo ──────────────────────────────
 if __name__ == "__main__":
     backfill_units_meta()
     _usda_weights.cache_clear()
 
-    TEST = [5476, 5490, 5505, 5541, 5549, 5668, 5687, 5691, 5716, 5508, 5715]
-    total_count = 0
+    TEST = [5508, 5715]
     for row in aggregate(TEST):
         logging.info("[%s] %-40s %6.2f %s",
                     row["usda_id"], row["usda_name"],
                     row["quantity"], row["unit"])
-        if row["unit"] == "count":
-            total_count += row["quantity"]
         for step in row.get("trace", []):
             print("     •", step)
-
-    # 👇 Show final total
-    print(f"\n🧮 Final total: {total_count:.0f} scallions\n")
-
 
 
